@@ -32,16 +32,15 @@
     "chokidar": "^5.0.0",
     "glob": "^11.0.0",
     "gray-matter": "^4.0.3",
-    "node-llama-cpp": "^3.14.5",
     "sqlite-vec": "^0.1.7-alpha.2",
     "yaml": "^2.6.1",
     "zod": "^4.2.1"
   },
   "optionalDependencies": {
+    "node-llama-cpp": "^3.14.5",
     "sqlite-vec-darwin-arm64": "^0.1.7-alpha.2",
     "sqlite-vec-darwin-x64": "^0.1.7-alpha.2",
-    "sqlite-vec-linux-x64": "^0.1.7-alpha.2",
-    "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
+    "sqlite-vec-linux-x64": "^0.1.7-alpha.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
@@ -60,5 +59,6 @@
     "bm25",
     "embeddings"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "packageManager": "npm@10.0.0"
 }
