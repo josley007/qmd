@@ -1,27 +1,40 @@
 {
-  "name": "qmd",
+  "name": "@violoop/memoir",
   "version": "1.0.0",
-  "description": "Quick Markdown Search - Full-text and vector search for markdown files",
+  "description": "Memoir - Tree-structured memory system with full-text search for AI assistants",
   "type": "module",
-  "bin": {
-    "qmd": "./qmd"
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./qmd": {
+      "import": "./dist/src/qmd.js",
+      "require": "./dist/src/qmd.js",
+      "types": "./dist/src/qmd.d.ts"
+    },
+    "./memory": {
+      "import": "./dist/src/memory.js",
+      "require": "./dist/src/memory.js",
+      "types": "./dist/src/memory.d.ts"
+    }
   },
   "scripts": {
-    "test": "bun test",
-    "qmd": "bun src/qmd.ts",
-    "index": "bun src/qmd.ts index",
-    "vector": "bun src/qmd.ts vector",
-    "search": "bun src/qmd.ts search",
-    "vsearch": "bun src/qmd.ts vsearch",
-    "rerank": "bun src/qmd.ts rerank",
-    "link": "bun link",
-    "inspector": "npx @modelcontextprotocol/inspector bun src/qmd.ts mcp"
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node test/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.1",
+    "better-sqlite3": "^11.7.0",
+    "chokidar": "^5.0.0",
+    "glob": "^11.0.0",
+    "gray-matter": "^4.0.3",
     "node-llama-cpp": "^3.14.5",
     "sqlite-vec": "^0.1.7-alpha.2",
-    "yaml": "^2.8.2",
+    "yaml": "^2.6.1",
     "zod": "^4.2.1"
   },
   "optionalDependencies": {
@@ -31,23 +44,21 @@
     "sqlite-vec-win32-x64": "^0.1.7-alpha.2"
   },
   "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5.9.3"
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/chokidar": "^1.7.5",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
   },
   "engines": {
-    "bun": ">=1.0.0"
+    "node": ">=18.0.0"
   },
   "keywords": [
     "markdown",
     "search",
     "fts",
     "vector",
-    "sqlite",
     "bm25",
-    "embeddings",
-    "ollama"
+    "embeddings"
   ],
   "license": "MIT"
 }
