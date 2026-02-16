@@ -61,6 +61,7 @@ export declare class QMD {
         collection?: string;
         limit?: number;
         minScore?: number;
+        useHybrid?: boolean;
     }): Promise<SearchResult[]>;
     /**
      * Vector semantic search
@@ -166,6 +167,26 @@ export declare class QMD {
      * Unload embedding model (free memory)
      */
     unloadEmbeddingModel(): Promise<void>;
+    /**
+     * Get embedding status
+     */
+    getEmbeddingStatus(): {
+        total: number;
+        embedded: number;
+        pending: number;
+    };
+    /**
+     * Log embedding status
+     */
+    logEmbeddingStatus(): void;
+    /**
+     * Preload rerank model
+     */
+    preloadRerankModel(): Promise<void>;
+    /**
+     * Get rerank model loaded status
+     */
+    isRerankModelLoaded(): boolean;
     get(docPath: string): Promise<{
         path: string;
         content: string;

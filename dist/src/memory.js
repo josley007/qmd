@@ -28,12 +28,41 @@ export class Memoir {
     }
     /**
      * 初始化记忆系统
+     * @param options.autoEmbed - 是否自动生成 embedding (默认 true)
+     * @param options.autoRerank - 是否自动加载 reranker 模型 (默认 true)
      */
-    async initialize() {
+    async initialize(options) {
+        const autoEmbed = options?.autoEmbed !== false; // 默认开启
+        const autoRerank = options?.autoRerank !== false; // 默认开启
         await fs.promises.mkdir(this.memoryDir, { recursive: true });
         await this.qmd.initialize();
         await this.qmd.addCollection('memory', this.memoryDir);
         await this.qmd.reindex();
+        // 后台异步生成 embedding (不阻塞启动)
+        if (autoEmbed) {
+            console.log('[Memoir] Background: Generating embeddings...');
+            this.qmd.preloadEmbeddingModel()
+                .then(async () => {
+                const count = await this.qmd.embedAll();
+                this.qmd.logEmbeddingStatus();
+                console.log(`[Memoir] Background: Done! ${count} embeddings generated`);
+            })
+                .catch((err) => {
+                console.warn('[Memoir] Background embed failed:', err?.message || err);
+                this.qmd.logEmbeddingStatus();
+            });
+        }
+        // 后台异步加载 reranker 模型 (不阻塞启动)
+        if (autoRerank) {
+            console.log('[Memoir] Background: Loading reranker model...');
+            this.qmd.preloadRerankModel()
+                .then(() => {
+                console.log('[Memoir] Background: Reranker model loaded');
+            })
+                .catch((err) => {
+                console.warn('[Memoir] Background reranker load failed:', err?.message || err);
+            });
+        }
     }
     /**
      * 解析 key 为路径
@@ -51,8 +80,14 @@ export class Memoir {
     }
     /**
      * 从文件路径解析 key
+     * filePath 可能是绝对路径或相对路径
      */
     pathToKey(filePath) {
+        // 如果是相对路径，直接替换
+        if (!path.isAbsolute(filePath)) {
+            return filePath.replace(/\.md$/, '').replace(/\//g, '.');
+        }
+        // 如果是绝对路径，计算相对于 memoryDir 的路径
         const relative = path.relative(this.memoryDir, filePath);
         const key = relative
             .replace(/\.md$/, '')
@@ -258,6 +293,49 @@ export class Memoir {
             }
         }
         return lines.join('\n');
+    }
+    /**
+     * 获取指定层级的所有记忆（用于记忆注入）
+     * @param level - 层级 (1 = 顶层如 "life", 2 = "life.work", 以此类推)
+     * @returns 该层级的所有记忆及其内容
+     */
+    async getMemoriesByLevel(level) {
+        const tree = await this.list();
+        const results = [];
+        for (const [key, value] of Object.entries(tree)) {
+            if (key.startsWith('_'))
+                continue;
+            if (value._type !== 'file')
+                continue;
+            const parts = key.split('.');
+            if (parts.length !== level)
+                continue;
+            const entry = await this.get(key);
+            if (entry) {
+                results.push(entry);
+            }
+        }
+        return results.sort((a, b) => a.key.localeCompare(b.key));
+    }
+    /**
+     * 获取简化记忆树（用于 system prompt）
+     * 只包含 key、title、type，不加载内容
+     */
+    async getSimpleTree() {
+        const tree = await this.list();
+        const flat = [];
+        for (const [key, value] of Object.entries(tree)) {
+            if (key.startsWith('_'))
+                continue;
+            if (value._type !== 'file')
+                continue;
+            flat.push({
+                key,
+                title: value.title || key.split('.').pop() || key,
+                type: value.type || 'archival'
+            });
+        }
+        return { tree, flat };
     }
     /**
      * 搜索记忆

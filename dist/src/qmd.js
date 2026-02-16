@@ -15,12 +15,15 @@ export class QMDStore {
     dataDir;
     db = null;
     dbPath;
-    embeddingModel = 'embeddinggemma';
-    embeddingDimension = 1536;
+    embeddingModel = ''; // 需要用户配置完整路径
+    rerankModel = ''; // Reranker 模型
+    embeddingDimension = 768; // embeddinggemma-300M 默认 768 维
     // Model caching
     llamaInstance = null;
     embeddingModelInstance = null;
     embeddingContextInstance = null;
+    rerankModelInstance = null;
+    rerankContextInstance = null;
     modelLoading = null;
     constructor(dataDir = './qmd-data') {
         this.dataDir = dataDir;
@@ -111,6 +114,7 @@ export class QMDStore {
         this.db.exec(`CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS idx_content_hash ON content(hash)`);
         // FTS5 virtual table for full-text search
+        // Use unicode61 for better CJK support (each CJK character becomes a token)
         this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts 
       USING fts5(
@@ -118,7 +122,7 @@ export class QMDStore {
         doc,
         content=documents,
         content_rowid=rowid,
-        tokenize='porter unicode61'
+        tokenize='unicode61'
       )
     `);
         // Triggers to keep FTS in sync
@@ -208,10 +212,12 @@ export class QMDStore {
         stmt.run(name);
     }
     /**
-     * Generate document ID from hash
+     * Generate document ID from hash (use path + content to avoid collisions)
      */
-    getDocid(hash) {
-        return hash.substring(0, 6);
+    getDocid(hash, path) {
+        // Combine hash and path to avoid collisions
+        const combined = hash + '|' + path;
+        return crypto.createHash('sha256').update(combined).digest('hex').substring(0, 12);
     }
     /**
      * Add or update a document
@@ -219,7 +225,7 @@ export class QMDStore {
     upsertDocument(collectionId, docPath, title, content, frontmatter) {
         const db = this.getDb();
         const hash = crypto.createHash('md5').update(content).digest('hex');
-        const id = this.getDocid(hash);
+        const id = this.getDocid(hash, docPath);
         // Check if document exists
         const existing = db.prepare('SELECT id FROM documents WHERE collection_id = ? AND path = ?').get(collectionId, docPath);
         if (existing) {
@@ -279,6 +285,7 @@ export class QMDStore {
         if (terms.length === 0)
             return [];
         const ftsQuery = terms.map(t => `"${t}"*`).join(' AND ');
+        console.log(`[QMD] BM25 search: query="${query}", fts="${ftsQuery}"`);
         let sql = `
       SELECT
         d.id,
@@ -300,6 +307,7 @@ export class QMDStore {
         sql += ` ORDER BY bm25_score ASC LIMIT ?`;
         params.push(limit);
         const rows = db.prepare(sql).all(...params);
+        console.log(`[QMD] BM25 results: ${rows.length}`, rows.map(r => ({ path: r.path, score: r.bm25_score })));
         return rows.map(row => {
             // Convert BM25 score to [0..1] where higher is better
             const score = Math.abs(row.bm25_score) / (1 + Math.abs(row.bm25_score));
@@ -375,7 +383,7 @@ export class QMDStore {
     // =============================================================================
     /**
      * Vector semantic search
-     * @param embedding - Pre-computed embedding vector (or null to skip vector search)
+     * @param embedding - Pre-computed query embedding vector (or null to skip vector search)
      */
     async searchVec(embedding, collectionName, limit = 10) {
         const db = this.getDb();
@@ -394,6 +402,7 @@ export class QMDStore {
       FROM vectors_vec
       WHERE embedding MATCH ? AND k = ?
     `).all(new Float32Array(embedding), limit * 3);
+        console.log(`[QMD] Vector search: ${vecResults.length} results`, vecResults.slice(0, 3).map(r => ({ hash_seq: r.hash_seq.substring(0, 20), distance: r.distance })));
         if (vecResults.length === 0)
             return [];
         // Step 2: Get document data
@@ -446,45 +455,181 @@ export class QMDStore {
         }));
     }
     /**
-     * Hybrid search: BM25 + Vector with RRF fusion
-     * @param embedding - Pre-computed embedding vector (or null to skip vector search)
-     * @param options.rerank - Optional reranking function
+     * Hybrid search: BM25 + Vector with RRF fusion and reranking
+     * @param embedding - Pre-computed query embedding vector (optional)
+     * @param options.rerank - External reranking function (optional)
      */
     async searchHybrid(query, embedding, collectionName, limit = 10, options) {
         const weights = options?.weights || { bm25: 1.0, vec: 1.0 };
         const rrfK = options?.rrfK || 60;
+        const enableRerank = options?.enableRerank !== false; // 默认开启
         // Run BM25 and Vector searches in parallel
         const [bm25Results, vecResults] = await Promise.all([
-            this.searchBM25(query, collectionName, limit * 3),
-            this.searchVec(embedding, collectionName, limit * 3).catch(() => [])
+            this.searchBM25(query, collectionName, limit * 4),
+            this.searchVec(embedding, collectionName, limit * 4).catch(() => [])
         ]);
-        // If no reranking, use simple RRF
-        if (!options?.rerank) {
-            return this.rrfCombine(bm25Results, vecResults, weights, rrfK, limit);
+        // If only one source has results, return directly with proper scores
+        if (bm25Results.length > 0 && vecResults.length === 0) {
+            console.log('[QMD] Using BM25 only (no vector results)');
+            return bm25Results.slice(0, limit);
         }
-        // RRF fusion first to get candidates for reranking
-        const candidates = this.rrfCombine(bm25Results, vecResults, weights, rrfK, limit * 3);
-        // Prepare documents for reranking
-        const rerankDocs = candidates.map(c => ({
-            path: c.path,
-            content: c.content || ''
+        if (bm25Results.length === 0 && vecResults.length > 0) {
+            console.log('[QMD] Using vector only (no BM25 results)');
+            return vecResults.slice(0, limit);
+        }
+        if (bm25Results.length === 0 && vecResults.length === 0) {
+            console.log('[QMD] No results from either source');
+            return [];
+        }
+        // Both sources have results - use RRF
+        const candidates = this.rrfCombine(bm25Results, vecResults, weights, rrfK, limit * 4);
+        console.log(`[QMD] RRF combined: ${candidates.length} candidates`, candidates.slice(0, 5).map(c => ({ path: c.path, score: c.score.toFixed(4) })));
+        // If no reranking needed, return directly
+        if (!enableRerank || (!embedding && !options?.rerank)) {
+            return candidates.slice(0, limit);
+        }
+        // Reranking
+        let finalResults = [];
+        // 优先使用 reranker 模型
+        if (this.rerankContextInstance) {
+            try {
+                console.log('[QMD] Using reranker model for re-ranking...');
+                finalResults = await this.rerankWithModel(query, candidates, limit);
+            }
+            catch (err) {
+                console.warn('[QMD] Reranker failed, fallback to embedding rerank:', err);
+                if (embedding && embedding.length > 0) {
+                    finalResults = await this.rerankWithEmbedding(query, embedding, candidates, limit);
+                }
+                else {
+                    finalResults = this.rerankWithKeywords(query, candidates, limit);
+                }
+            }
+        }
+        else if (options?.rerank) {
+            // External reranking function
+            const rerankDocs = candidates.map(c => ({
+                path: c.path,
+                content: c.content || ''
+            }));
+            const reranked = await options.rerank(query, rerankDocs);
+            const rerankScoreMap = new Map(reranked.map(r => [r.path, r.score]));
+            const rrfScoreMap = new Map(candidates.map((c, i) => [c.path, 1 / (rrfK + i + 1)]));
+            finalResults = candidates.map(c => {
+                const rrfScore = rrfScoreMap.get(c.path) || 0;
+                const rerankScore = rerankScoreMap.get(c.path) || 0;
+                const blendedScore = 0.4 * rrfScore + 0.6 * rerankScore;
+                return { ...c, score: blendedScore, source: 'hybrid' };
+            }).sort((a, b) => b.score - a.score).slice(0, limit);
+        }
+        else if (embedding && embedding.length > 0) {
+            // Internal reranking using query embedding
+            finalResults = await this.rerankWithEmbedding(query, embedding, candidates, limit);
+        }
+        else {
+            // No embedding, use keyword-based reranking
+            finalResults = this.rerankWithKeywords(query, candidates, limit);
+        }
+        return finalResults;
+    }
+    /**
+     * Rerank using reranker model
+     */
+    async rerankWithModel(query, candidates, limit) {
+        if (!this.rerankContextInstance) {
+            throw new Error('Rerank model not loaded');
+        }
+        const texts = candidates.map(c => c.content || '');
+        // Use ranking context
+        const ranked = await this.rerankContextInstance.rankAndSort(query, texts);
+        // Map back to results
+        const scoreMap = new Map();
+        ranked.forEach((item, idx) => {
+            scoreMap.set(idx, item.score);
+        });
+        return candidates.map((c, idx) => ({
+            ...c,
+            score: scoreMap.get(idx) || c.score,
+            source: 'hybrid'
+        })).sort((a, b) => b.score - a.score).slice(0, limit);
+    }
+    /**
+     * Internal reranking using query embedding
+     */
+    async rerankWithEmbedding(query, queryEmbedding, candidates, limit) {
+        const db = this.getDb();
+        // Get embeddings for candidate documents
+        const candidateHashes = candidates.map(c => c.docId).filter(Boolean);
+        if (candidateHashes.length === 0) {
+            return candidates.slice(0, limit);
+        }
+        // Query embeddings from vectors table
+        const placeholders = candidateHashes.map(() => '?').join(',');
+        const vecRows = db.prepare(`
+      SELECT cv.hash, v.embedding
+      FROM content_vectors cv
+      JOIN vectors_vec v ON v.hash_seq = cv.hash || '_' || cv.seq
+      WHERE cv.hash IN (${placeholders})
+    `).all(...candidateHashes);
+        // Build hash -> embedding map
+        const hashEmbeddings = new Map();
+        for (const row of vecRows) {
+            hashEmbeddings.set(row.hash, row.embedding);
+        }
+        // Calculate similarity scores
+        const scored = candidates.map(c => {
+            const emb = hashEmbeddings.get(c.docId);
+            if (!emb) {
+                return { ...c, rerankScore: c.score };
+            }
+            // Cosine similarity
+            let dot = 0;
+            let norm1 = 0;
+            let norm2 = 0;
+            for (let i = 0; i < queryEmbedding.length && i < emb.length; i++) {
+                dot += queryEmbedding[i] * emb[i];
+                norm1 += queryEmbedding[i] * queryEmbedding[i];
+                norm2 += emb[i] * emb[i];
+            }
+            const similarity = norm1 > 0 && norm2 > 0 ? dot / (Math.sqrt(norm1) * Math.sqrt(norm2)) : 0;
+            return { ...c, rerankScore: similarity };
+        });
+        // Sort by rerank score
+        return scored.sort((a, b) => b.rerankScore - a.rerankScore).slice(0, limit).map(r => ({
+            ...r,
+            score: r.rerankScore,
+            source: 'hybrid'
         }));
-        // Call reranking function
-        const reranked = await options.rerank(query, rerankDocs);
-        const rerankScoreMap = new Map(reranked.map(r => [r.path, r.score]));
-        // Blend RRF score with reranker score
-        const rrfScoreMap = new Map(candidates.map((c, i) => [c.path, 1 / (rrfK + i + 1)]));
-        return candidates.map(c => {
-            const rrfScore = rrfScoreMap.get(c.path) || 0;
-            const rerankScore = rerankScoreMap.get(c.path) || 0;
-            // Blend: 40% RRF position, 60% reranker score
-            const blendedScore = 0.4 * rrfScore + 0.6 * rerankScore;
-            return {
-                ...c,
-                score: blendedScore,
-                source: 'hybrid'
-            };
-        }).sort((a, b) => b.score - a.score).slice(0, limit);
+    }
+    /**
+     * Keyword-based reranking (lightweight fallback)
+     */
+    rerankWithKeywords(query, candidates, limit) {
+        const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 1);
+        if (queryTerms.length === 0) {
+            return candidates.slice(0, limit);
+        }
+        const scored = candidates.map(c => {
+            const content = (c.title + ' ' + (c.content || '')).toLowerCase();
+            let matchScore = 0;
+            for (const term of queryTerms) {
+                if (content.includes(term)) {
+                    matchScore += 1;
+                    // Boost exact matches
+                    if (content.includes(term + ' ')) {
+                        matchScore += 0.5;
+                    }
+                }
+            }
+            // Combine with original score
+            const finalScore = c.score * 0.3 + (matchScore / queryTerms.length) * 0.7;
+            return { ...c, rerankScore: finalScore };
+        });
+        return scored.sort((a, b) => b.rerankScore - a.rerankScore).slice(0, limit).map(r => ({
+            ...r,
+            score: r.rerankScore,
+            source: 'hybrid'
+        }));
     }
     /**
      * Reciprocal Rank Fusion - combine multiple result lists
@@ -521,12 +666,14 @@ export class QMDStore {
                 existing.result.score = (existing.result.score + r.score) / 2;
             }
         }
+        // Normalize scores to 0-1 range (higher is better)
+        const maxScore = Math.max(...Array.from(scores.values()).map(s => s.rrfScore), 0.0001);
         return Array.from(scores.values())
             .sort((a, b) => b.rrfScore - a.rrfScore)
             .slice(0, limit)
             .map(({ result, rrfScore }) => ({
             ...result,
-            score: rrfScore,
+            score: rrfScore / maxScore, // Normalize to 0-1
             source: (bm25Results.length > 0 && vecResults.length > 0) ? 'hybrid' : result.source
         }));
     }
@@ -572,8 +719,10 @@ export class QMDStore {
     }
     /**
      * Set embedding model
+     * @param model - 模型路径或模型名称 (会从默认位置查找)
+     * @param dimension - 向量维度
      */
-    setEmbeddingModel(model, dimension = 1536) {
+    setEmbeddingModel(model, dimension = 768) {
         this.embeddingModel = model;
         this.embeddingDimension = dimension;
         this.ensureVecTable(dimension);
@@ -582,7 +731,156 @@ export class QMDStore {
      * Get current embedding model
      */
     getEmbeddingModel() {
-        return this.embeddingModel;
+        return this.embeddingModel || '未配置';
+    }
+    /**
+     * Set rerank model
+     * @param model - 模型路径或 HuggingFace URI
+     */
+    setRerankModel(model) {
+        this.rerankModel = model;
+    }
+    /**
+     * Get current rerank model
+     */
+    getRerankModel() {
+        return this.rerankModel || '未配置';
+    }
+    /**
+     * Get default model search paths
+     */
+    getDefaultModelPaths() {
+        const paths = [];
+        const home = process.env.HOME || process.env.USERPROFILE || '';
+        const appData = process.env.APPDATA || process.env.LOCALAPPDATA || '';
+        // violoop 数据目录
+        if (appData) {
+            paths.push(path.join(appData, 'violoop', 'models'));
+        }
+        if (home) {
+            paths.push(path.join(home, '.violoop', 'models'));
+            paths.push(path.join(home, '.cache', 'violoop', 'models'));
+        }
+        // 通用模型目录
+        paths.push(path.join(home, 'models'));
+        paths.push(path.join(home, '.cache', 'models'));
+        return paths;
+    }
+    /**
+     * Find model file
+     */
+    findModelFile(modelName) {
+        const paths = this.getDefaultModelPaths();
+        const extensions = ['', '.gguf', '.bin', '.q4_k_m.gguf', '.Q4_K_M.gguf'];
+        for (const basePath of paths) {
+            for (const ext of extensions) {
+                const fullPath = path.join(basePath, modelName + ext);
+                try {
+                    if (fs.existsSync(fullPath)) {
+                        return fullPath;
+                    }
+                }
+                catch { }
+            }
+        }
+        // 直接检查是否是绝对路径
+        if (fs.existsSync(modelName)) {
+            return modelName;
+        }
+        return null;
+    }
+    /**
+     * Resolve model path - auto download if needed
+     */
+    async resolveModelPath() {
+        // 如果已经配置了模型路径
+        if (this.embeddingModel && fs.existsSync(this.embeddingModel)) {
+            return this.embeddingModel;
+        }
+        try {
+            const { resolveModelFile } = await import('node-llama-cpp');
+            // 默认模型 - 使用 HuggingFace URI 格式
+            const defaultModel = this.embeddingModel || 'hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf';
+            console.log(`[QMD] Resolving embedding model: ${defaultModel}...`);
+            // 自动下载模型
+            const modelPath = await resolveModelFile(defaultModel);
+            console.log(`[QMD] Model resolved to: ${modelPath}`);
+            return modelPath;
+        }
+        catch (err) {
+            console.error('[QMD] Failed to resolve model:', err);
+            return null;
+        }
+    }
+    /**
+     * Resolve rerank model path - auto download if needed
+     */
+    async resolveRerankModelPath() {
+        if (this.rerankModel && fs.existsSync(this.rerankModel)) {
+            return this.rerankModel;
+        }
+        try {
+            const { resolveModelFile } = await import('node-llama-cpp');
+            // 默认 reranker 模型 - 使用 HuggingFace URI 格式
+            const defaultModel = this.rerankModel || 'hf:ggml-org/Qwen3-Reranker-0.6B-GGUF/qwen3-reranker-0.6b-q8_0.gguf';
+            console.log(`[QMD] Resolving rerank model: ${defaultModel}...`);
+            const modelPath = await resolveModelFile(defaultModel);
+            console.log(`[QMD] Rerank model resolved to: ${modelPath}`);
+            return modelPath;
+        }
+        catch (err) {
+            console.error('[QMD] Failed to resolve rerank model:', err);
+            return null;
+        }
+    }
+    /**
+     * Ensure rerank model is loaded
+     */
+    async ensureRerankModel() {
+        if (this.rerankContextInstance) {
+            return;
+        }
+        if (this.modelLoading) {
+            await this.modelLoading;
+            return;
+        }
+        this.modelLoading = this.loadRerankModel();
+        await this.modelLoading;
+        this.modelLoading = null;
+    }
+    /**
+     * Load rerank model
+     */
+    async loadRerankModel() {
+        const modelPath = await this.resolveRerankModelPath();
+        if (!modelPath) {
+            console.warn('[QMD] No rerank model found, reranking will be skipped');
+            return;
+        }
+        console.log(`[QMD] Loading rerank model: ${modelPath}...`);
+        try {
+            if (!this.llamaInstance) {
+                const { getLlama } = await import('node-llama-cpp');
+                this.llamaInstance = await getLlama();
+            }
+            this.rerankModelInstance = await this.llamaInstance.loadModel({
+                modelPath: modelPath,
+            });
+            console.log('[QMD] Rerank model loaded:', modelPath);
+            this.rerankContextInstance = await this.rerankModelInstance.createRankingContext();
+            console.log('[QMD] Rerank context ready');
+        }
+        catch (err) {
+            console.error('[QMD] Failed to load rerank model:', err);
+            this.rerankModelInstance = null;
+            this.rerankContextInstance = null;
+        }
+    }
+    /**
+     * Check if rerank model is loaded
+     */
+    isRerankModelLoaded() {
+        return this.rerankContextInstance !== null;
     }
     /**
      * Get embedding dimension
@@ -638,15 +936,23 @@ export class QMDStore {
      * Load the embedding model
      */
     async loadEmbeddingModel() {
-        console.log(`[QMD] Loading embedding model: ${this.embeddingModel}...`);
+        // 解析模型路径 (自动下载)
+        const modelPath = await this.resolveModelPath();
+        if (!modelPath) {
+            const msg = '[QMD] No embedding model found. Please set embedding model path or check network connection.';
+            console.warn(msg);
+            console.warn('[QMD] You can manually download models from: https://huggingface.co/models?search=embedding');
+            throw new Error('No embedding model found');
+        }
+        console.log(`[QMD] Loading embedding model: ${modelPath}...`);
         try {
             const { getLlama } = await import('node-llama-cpp');
             this.llamaInstance = await getLlama();
             console.log('[QMD] Llama instance ready');
             this.embeddingModelInstance = await this.llamaInstance.loadModel({
-                modelPath: this.embeddingModel,
+                modelPath: modelPath,
             });
-            console.log('[QMD] Embedding model loaded:', this.embeddingModel);
+            console.log('[QMD] Embedding model loaded:', modelPath);
             this.embeddingContextInstance = await this.embeddingModelInstance.createEmbeddingContext();
             console.log('[QMD] Embedding context ready, dimension:', this.embeddingDimension);
         }
@@ -665,6 +971,14 @@ export class QMDStore {
         console.log('[QMD] Preloading embedding model...');
         await this.ensureEmbeddingModel();
         console.log('[QMD] Embedding model preloaded');
+    }
+    /**
+     * Preload rerank model
+     */
+    async preloadRerankModel() {
+        console.log('[QMD] Preloading rerank model...');
+        await this.ensureRerankModel();
+        console.log('[QMD] Rerank model preloaded');
     }
     /**
      * Check if embedding model is loaded
@@ -744,6 +1058,12 @@ export class QMDStore {
      * @returns Number of documents embedded
      */
     async embedAll(options) {
+        // Check if embedding model is loaded
+        if (!this.isEmbeddingModelLoaded()) {
+            console.log('[QMD] Embedding model not loaded, skipping embedAll');
+            this.logEmbeddingStatus();
+            return 0;
+        }
         const hashes = this.getHashesForEmbedding();
         if (hashes.length === 0) {
             console.log('[QMD] No documents need embedding');
@@ -797,16 +1117,20 @@ export class QMDStore {
         // Check for changes and embed
         const scanAndEmbed = async () => {
             try {
+                const status = this.getEmbeddingStatus();
+                console.log(`[QMD] Embedding check: ${status.embedded}/${status.total} embedded, ${status.pending} pending`);
                 const hashes = this.getHashesForEmbedding();
                 if (hashes.length > 0) {
-                    console.log(`[QMD] Auto-embed: Found ${hashes.length} documents needing embedding`);
-                    for (const { hash, body } of hashes) {
+                    console.log(`[QMD] Auto-embed: Generating embeddings for ${hashes.length} documents...`);
+                    let embedded = 0;
+                    for (const { hash, body, path } of hashes) {
                         const embedding = await this.embedDocument(body);
                         if (embedding) {
                             await this.insertEmbedding(hash, 0, 0, embedding);
+                            embedded++;
                         }
                     }
-                    console.log(`[QMD] Auto-embed: Processed ${hashes.length} documents`);
+                    console.log(`[QMD] Auto-embed: Done! ${embedded}/${hashes.length} documents embedded`);
                 }
             }
             catch (err) {
@@ -887,6 +1211,32 @@ export class QMDStore {
         }
         this.isWatching = false;
         console.log('[QMD] Auto-embed stopped');
+    }
+    /**
+     * Get embedding status - how many documents have embeddings
+     */
+    getEmbeddingStatus() {
+        try {
+            const db = this.getDb();
+            // Total documents
+            const total = db.prepare('SELECT COUNT(*) as count FROM documents WHERE active = 1').get()?.count || 0;
+            // Documents with embeddings
+            const embedded = db.prepare('SELECT COUNT(DISTINCT hash) as count FROM content_vectors').get()?.count || 0;
+            // Pending
+            const pending = total - embedded;
+            return { total, embedded, pending };
+        }
+        catch (err) {
+            console.warn('[QMD] Failed to get embedding status:', err);
+            return { total: 0, embedded: 0, pending: 0 };
+        }
+    }
+    /**
+     * Log embedding status
+     */
+    logEmbeddingStatus() {
+        const status = this.getEmbeddingStatus();
+        console.log(`[QMD] Embedding status: ${status.embedded}/${status.total} embedded, ${status.pending} pending`);
     }
     /**
      * Check if auto-embed is running

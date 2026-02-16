@@ -86,11 +86,27 @@ export class QMD {
     collection?: string
     limit?: number
     minScore?: number
+    useHybrid?: boolean  // 是否使用混合搜索 (默认 true)
   } = {}): Promise<SearchResult[]> {
     const limit = options.limit || 10
     const minScore = options.minScore || 0
+    const useHybrid = options.useHybrid !== false  // 默认使用混合搜索
     
-    const results = this.store.searchBM25(query, options.collection, limit)
+    let results
+    
+    if (useHybrid && this.store.isEmbeddingModelLoaded()) {
+      // 使用混合搜索
+      try {
+        const embedding = await this.store.embedQuery(query)
+        results = await this.store.searchHybrid(query, embedding, options.collection, limit)
+      } catch (err) {
+        console.warn('[QMD] Hybrid search failed, fallback to BM25:', err)
+        results = this.store.searchBM25(query, options.collection, limit)
+      }
+    } else {
+      // 使用 BM25
+      results = this.store.searchBM25(query, options.collection, limit)
+    }
     
     return results
       .map(r => ({
@@ -99,7 +115,7 @@ export class QMD {
         title: r.title || '',
         content: r.content?.substring(0, 500) || '',
         score: Math.abs(r.score || 0),
-        type: 'bm25' as const
+        type: (r.source === 'vec' ? 'vector' : r.source === 'bm25' ? 'bm25' : 'hybrid') as 'bm25' | 'vector' | 'hybrid'
       }))
       .filter(r => r.score >= minScore)
   }
@@ -284,6 +300,34 @@ export class QMD {
    */
   async unloadEmbeddingModel(): Promise<void> {
     await this.store.unloadEmbeddingModel()
+  }
+
+  /**
+   * Get embedding status
+   */
+  getEmbeddingStatus(): { total: number; embedded: number; pending: number } {
+    return this.store.getEmbeddingStatus()
+  }
+
+  /**
+   * Log embedding status
+   */
+  logEmbeddingStatus(): void {
+    this.store.logEmbeddingStatus()
+  }
+
+  /**
+   * Preload rerank model
+   */
+  async preloadRerankModel(): Promise<void> {
+    await this.store.preloadRerankModel()
+  }
+
+  /**
+   * Get rerank model loaded status
+   */
+  isRerankModelLoaded(): boolean {
+    return this.store.isRerankModelLoaded()
   }
 
   async get(docPath: string): Promise<{ path: string; content: string; frontmatter: Record<string, unknown> } | null> {

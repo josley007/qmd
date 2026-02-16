@@ -20,10 +20,13 @@ export declare class QMDStore {
     private db;
     private dbPath;
     private embeddingModel;
+    private rerankModel;
     private embeddingDimension;
     private llamaInstance;
     private embeddingModelInstance;
     private embeddingContextInstance;
+    private rerankModelInstance;
+    private rerankContextInstance;
     private modelLoading;
     constructor(dataDir?: string);
     /**
@@ -73,7 +76,7 @@ export declare class QMDStore {
      */
     removeCollection(name: string): void;
     /**
-     * Generate document ID from hash
+     * Generate document ID from hash (use path + content to avoid collisions)
      */
     private getDocid;
     /**
@@ -109,13 +112,13 @@ export declare class QMDStore {
     private findMarkdownFiles;
     /**
      * Vector semantic search
-     * @param embedding - Pre-computed embedding vector (or null to skip vector search)
+     * @param embedding - Pre-computed query embedding vector (or null to skip vector search)
      */
     searchVec(embedding: number[] | null, collectionName?: string, limit?: number): Promise<SearchResult[]>;
     /**
-     * Hybrid search: BM25 + Vector with RRF fusion
-     * @param embedding - Pre-computed embedding vector (or null to skip vector search)
-     * @param options.rerank - Optional reranking function
+     * Hybrid search: BM25 + Vector with RRF fusion and reranking
+     * @param embedding - Pre-computed query embedding vector (optional)
+     * @param options.rerank - External reranking function (optional)
      */
     searchHybrid(query: string, embedding: number[] | null, collectionName?: string, limit?: number, options?: {
         rerank?: (query: string, documents: {
@@ -130,7 +133,20 @@ export declare class QMDStore {
             vec: number;
         };
         rrfK?: number;
+        enableRerank?: boolean;
     }): Promise<SearchResult[]>;
+    /**
+     * Rerank using reranker model
+     */
+    private rerankWithModel;
+    /**
+     * Internal reranking using query embedding
+     */
+    private rerankWithEmbedding;
+    /**
+     * Keyword-based reranking (lightweight fallback)
+     */
+    private rerankWithKeywords;
     /**
      * Reciprocal Rank Fusion - combine multiple result lists
      */
@@ -153,12 +169,51 @@ export declare class QMDStore {
     clearAllEmbeddings(): void;
     /**
      * Set embedding model
+     * @param model - 模型路径或模型名称 (会从默认位置查找)
+     * @param dimension - 向量维度
      */
     setEmbeddingModel(model: string, dimension?: number): void;
     /**
      * Get current embedding model
      */
     getEmbeddingModel(): string;
+    /**
+     * Set rerank model
+     * @param model - 模型路径或 HuggingFace URI
+     */
+    setRerankModel(model: string): void;
+    /**
+     * Get current rerank model
+     */
+    getRerankModel(): string;
+    /**
+     * Get default model search paths
+     */
+    private getDefaultModelPaths;
+    /**
+     * Find model file
+     */
+    private findModelFile;
+    /**
+     * Resolve model path - auto download if needed
+     */
+    private resolveModelPath;
+    /**
+     * Resolve rerank model path - auto download if needed
+     */
+    private resolveRerankModelPath;
+    /**
+     * Ensure rerank model is loaded
+     */
+    private ensureRerankModel;
+    /**
+     * Load rerank model
+     */
+    private loadRerankModel;
+    /**
+     * Check if rerank model is loaded
+     */
+    isRerankModelLoaded(): boolean;
     /**
      * Get embedding dimension
      */
@@ -182,6 +237,10 @@ export declare class QMDStore {
      * Preload embedding model (call this before first embedding to avoid delay)
      */
     preloadEmbeddingModel(): Promise<void>;
+    /**
+     * Preload rerank model
+     */
+    preloadRerankModel(): Promise<void>;
     /**
      * Check if embedding model is loaded
      */
@@ -235,6 +294,18 @@ export declare class QMDStore {
      * Stop watching and auto-embedding
      */
     stopAutoEmbed(): void;
+    /**
+     * Get embedding status - how many documents have embeddings
+     */
+    getEmbeddingStatus(): {
+        total: number;
+        embedded: number;
+        pending: number;
+    };
+    /**
+     * Log embedding status
+     */
+    logEmbeddingStatus(): void;
     /**
      * Check if auto-embed is running
      */

@@ -45,8 +45,13 @@ export declare class Memoir {
     });
     /**
      * 初始化记忆系统
+     * @param options.autoEmbed - 是否自动生成 embedding (默认 true)
+     * @param options.autoRerank - 是否自动加载 reranker 模型 (默认 true)
      */
-    initialize(): Promise<void>;
+    initialize(options?: {
+        autoEmbed?: boolean;
+        autoRerank?: boolean;
+    }): Promise<void>;
     /**
      * 解析 key 为路径
      * life.work.project-a -> life/work/project-a.md
@@ -54,6 +59,7 @@ export declare class Memoir {
     private keyToPath;
     /**
      * 从文件路径解析 key
+     * filePath 可能是绝对路径或相对路径
      */
     private pathToKey;
     /**
@@ -79,6 +85,24 @@ export declare class Memoir {
      * 获取记忆树（用于 LLM 提示词嵌入）
      */
     getTreeForPrompt(): Promise<string>;
+    /**
+     * 获取指定层级的所有记忆（用于记忆注入）
+     * @param level - 层级 (1 = 顶层如 "life", 2 = "life.work", 以此类推)
+     * @returns 该层级的所有记忆及其内容
+     */
+    getMemoriesByLevel(level: number): Promise<MemoryEntry[]>;
+    /**
+     * 获取简化记忆树（用于 system prompt）
+     * 只包含 key、title、type，不加载内容
+     */
+    getSimpleTree(): Promise<{
+        tree: Record<string, MemoryTreeNode>;
+        flat: {
+            key: string;
+            title: string;
+            type: string;
+        }[];
+    }>;
     /**
      * 搜索记忆
      */

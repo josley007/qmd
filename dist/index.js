@@ -57,7 +57,23 @@ export class QMD {
     async search(query, options = {}) {
         const limit = options.limit || 10;
         const minScore = options.minScore || 0;
-        const results = this.store.searchBM25(query, options.collection, limit);
+        const useHybrid = options.useHybrid !== false; // 默认使用混合搜索
+        let results;
+        if (useHybrid && this.store.isEmbeddingModelLoaded()) {
+            // 使用混合搜索
+            try {
+                const embedding = await this.store.embedQuery(query);
+                results = await this.store.searchHybrid(query, embedding, options.collection, limit);
+            }
+            catch (err) {
+                console.warn('[QMD] Hybrid search failed, fallback to BM25:', err);
+                results = this.store.searchBM25(query, options.collection, limit);
+            }
+        }
+        else {
+            // 使用 BM25
+            results = this.store.searchBM25(query, options.collection, limit);
+        }
         return results
             .map(r => ({
             id: r.docId,
@@ -65,7 +81,7 @@ export class QMD {
             title: r.title || '',
             content: r.content?.substring(0, 500) || '',
             score: Math.abs(r.score || 0),
-            type: 'bm25'
+            type: (r.source === 'vec' ? 'vector' : r.source === 'bm25' ? 'bm25' : 'hybrid')
         }))
             .filter(r => r.score >= minScore);
     }
@@ -206,6 +222,30 @@ export class QMD {
      */
     async unloadEmbeddingModel() {
         await this.store.unloadEmbeddingModel();
+    }
+    /**
+     * Get embedding status
+     */
+    getEmbeddingStatus() {
+        return this.store.getEmbeddingStatus();
+    }
+    /**
+     * Log embedding status
+     */
+    logEmbeddingStatus() {
+        this.store.logEmbeddingStatus();
+    }
+    /**
+     * Preload rerank model
+     */
+    async preloadRerankModel() {
+        await this.store.preloadRerankModel();
+    }
+    /**
+     * Get rerank model loaded status
+     */
+    isRerankModelLoaded() {
+        return this.store.isRerankModelLoaded();
     }
     async get(docPath) {
         return this.store.getDocument(docPath);
