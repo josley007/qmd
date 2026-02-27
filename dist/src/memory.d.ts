@@ -34,11 +34,32 @@ export interface MemoryTreeNode {
     title?: string;
     type?: string;
     id?: string;
+    updated_at?: string | null;
+    half_life_days?: number | null;
     [key: string]: unknown;
+}
+export interface MemoryTreeItem {
+    key: string;
+    name: string;
+    isFolder: boolean;
+    type?: string;
+    title?: string;
+    updated_at?: string | null;
+    half_life_days?: number | null;
+    children: MemoryTreeItem[];
+}
+export interface MemoryZone {
+    name: string;
+    keyPrefix: string;
+    maxItems?: number;
+    maxDepth?: number;
+    defaultType?: string;
+    defaultHalfLife?: number;
 }
 export declare class Memoir {
     private qmd;
     private memoryDir;
+    private zones;
     constructor(options?: {
         memoryDir?: string;
         dataDir?: string;
@@ -52,6 +73,27 @@ export declare class Memoir {
         autoEmbed?: boolean;
         autoRerank?: boolean;
     }): Promise<void>;
+    /**
+     * 定义一个记忆 zone
+     */
+    defineZone(name: string, options: Omit<MemoryZone, 'name'>): void;
+    /**
+     * 查找匹配 key 的 zone
+     */
+    private findZone;
+    /**
+     * 统计指定前缀下的文件数
+     */
+    private countKeysWithPrefix;
+    /**
+     * 获取各 zone 的条目统计
+     */
+    getZoneStats(): Promise<Array<{
+        zone: string;
+        keyPrefix: string;
+        count: number;
+        maxItems?: number;
+    }>>;
     /**
      * 解析 key 为路径
      * life.work.project-a -> life/work/project-a.md
@@ -82,20 +124,31 @@ export declare class Memoir {
      */
     list(): Promise<Record<string, MemoryTreeNode>>;
     /**
+     * 列出所有记忆（嵌套树结构）
+     * 直接返回前端可渲染的树形数组，无需客户端转换
+     */
+    listTree(): Promise<MemoryTreeItem[]>;
+    /**
      * 获取记忆树（用于 LLM 提示词嵌入）
      */
-    getTreeForPrompt(): Promise<string>;
+    getTreeForPrompt(options?: {
+        prefix?: string;
+    }): Promise<string>;
     /**
      * 获取指定层级的所有记忆（用于记忆注入）
      * @param level - 层级 (1 = 顶层如 "life", 2 = "life.work", 以此类推)
      * @returns 该层级的所有记忆及其内容
      */
-    getMemoriesByLevel(level: number): Promise<MemoryEntry[]>;
+    getMemoriesByLevel(level: number, options?: {
+        prefix?: string;
+    }): Promise<MemoryEntry[]>;
     /**
      * 获取简化记忆树（用于 system prompt）
      * 只包含 key、title、type，不加载内容
      */
-    getSimpleTree(): Promise<{
+    getSimpleTree(options?: {
+        prefix?: string;
+    }): Promise<{
         tree: Record<string, MemoryTreeNode>;
         flat: {
             key: string;

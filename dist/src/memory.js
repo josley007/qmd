@@ -22,6 +22,7 @@ import { QMD } from '../index.js';
 export class Memoir {
     qmd;
     memoryDir;
+    zones = [];
     constructor(options = {}) {
         this.memoryDir = options.memoryDir || './memory';
         this.qmd = new QMD({ dataDir: options.dataDir || './memoir-data' });
@@ -65,6 +66,61 @@ export class Memoir {
         }
     }
     /**
+     * 定义一个记忆 zone
+     */
+    defineZone(name, options) {
+        this.zones = this.zones.filter(z => z.name !== name);
+        this.zones.push({ name, ...options });
+    }
+    /**
+     * 查找匹配 key 的 zone
+     */
+    findZone(key) {
+        return this.zones.find(z => key === z.keyPrefix || key.startsWith(z.keyPrefix + '.'));
+    }
+    /**
+     * 统计指定前缀下的文件数
+     */
+    async countKeysWithPrefix(prefix) {
+        const prefixDir = path.join(this.memoryDir, prefix.replace(/\./g, '/'));
+        try {
+            const stat = await fs.promises.stat(prefixDir);
+            if (!stat.isDirectory())
+                return 0;
+        }
+        catch {
+            return 0;
+        }
+        let count = 0;
+        const scan = async (dir) => {
+            const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (entry.name.startsWith('.'))
+                    continue;
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    await scan(fullPath);
+                }
+                else if (entry.name.endsWith('.md')) {
+                    count++;
+                }
+            }
+        };
+        await scan(prefixDir);
+        return count;
+    }
+    /**
+     * 获取各 zone 的条目统计
+     */
+    async getZoneStats() {
+        const stats = [];
+        for (const z of this.zones) {
+            const count = await this.countKeysWithPrefix(z.keyPrefix);
+            stats.push({ zone: z.name, keyPrefix: z.keyPrefix, count, maxItems: z.maxItems });
+        }
+        return stats;
+    }
+    /**
      * 解析 key 为路径
      * life.work.project-a -> life/work/project-a.md
      */
@@ -98,7 +154,25 @@ export class Memoir {
      * 添加或更新记忆
      */
     async set(key, content, metadata = {}) {
-        const { dir, file } = this.keyToPath(key);
+        const { dir, file, parts } = this.keyToPath(key);
+        // Zone 校验
+        const zone = this.findZone(key);
+        if (zone) {
+            // maxDepth 校验
+            if (zone.maxDepth && parts.length > zone.maxDepth) {
+                throw new Error(`Zone "${zone.name}" 限制 key 深度最多 ${zone.maxDepth} 层，当前: ${parts.length} (${key})`);
+            }
+            // maxItems 校验（仅新建时）
+            if (zone.maxItems) {
+                const fileExists = await fs.promises.access(file).then(() => true).catch(() => false);
+                if (!fileExists) {
+                    const count = await this.countKeysWithPrefix(zone.keyPrefix);
+                    if (count >= zone.maxItems) {
+                        throw new Error(`Zone "${zone.name}" 已达条目上限 ${zone.maxItems}，无法新建 "${key}"。请更新已有记忆或删除不需要的记忆。`);
+                    }
+                }
+            }
+        }
         await fs.promises.mkdir(dir, { recursive: true });
         let existingData = {};
         let existingContent = '';
@@ -116,6 +190,15 @@ export class Memoir {
         for (const [k, v] of Object.entries(metadata)) {
             if (v !== undefined) {
                 cleanMetadata[k] = v;
+            }
+        }
+        // 应用 zone 默认值（仅当调用方未显式指定时）
+        if (zone) {
+            if (zone.defaultType && !cleanMetadata.type) {
+                cleanMetadata.type = zone.defaultType;
+            }
+            if (zone.defaultHalfLife !== undefined && cleanMetadata.half_life_days === undefined) {
+                cleanMetadata.half_life_days = zone.defaultHalfLife;
             }
         }
         const frontmatter = {
@@ -238,7 +321,9 @@ export class Memoir {
                             _type: 'file',
                             title: parsed.data.title || entry.name.replace('.md', ''),
                             type: parsed.data.type || 'archival',
-                            id: parsed.data.id || key
+                            id: parsed.data.id || key,
+                            updated_at: parsed.data.updated_at || null,
+                            half_life_days: parsed.data.half_life_days ?? null
                         };
                     }
                     catch (e) {
@@ -256,10 +341,72 @@ export class Memoir {
         return tree;
     }
     /**
+     * 列出所有记忆（嵌套树结构）
+     * 直接返回前端可渲染的树形数组，无需客户端转换
+     */
+    async listTree() {
+        const scanDir = async (dir, prefix = []) => {
+            let entries;
+            try {
+                entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            }
+            catch {
+                return [];
+            }
+            const items = [];
+            // Sort: directories first, then alphabetical
+            const sorted = entries
+                .filter(e => !e.name.startsWith('.'))
+                .sort((a, b) => {
+                if (a.isDirectory() !== b.isDirectory())
+                    return a.isDirectory() ? -1 : 1;
+                return a.name.localeCompare(b.name);
+            });
+            for (const entry of sorted) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    const currentPath = [...prefix, entry.name];
+                    const children = await scanDir(fullPath, currentPath);
+                    items.push({
+                        key: currentPath.join('.'),
+                        name: entry.name,
+                        isFolder: true,
+                        children,
+                    });
+                }
+                else if (entry.name.endsWith('.md')) {
+                    const currentPath = [...prefix, entry.name];
+                    const key = currentPath.join('.').replace(/\.md$/, '');
+                    const name = entry.name.replace(/\.md$/, '');
+                    try {
+                        const raw = await fs.promises.readFile(fullPath, 'utf-8');
+                        const parsed = matter(raw);
+                        items.push({
+                            key,
+                            name,
+                            isFolder: false,
+                            title: parsed.data.title || name,
+                            type: parsed.data.type || 'archival',
+                            updated_at: parsed.data.updated_at || null,
+                            half_life_days: parsed.data.half_life_days ?? null,
+                            children: [],
+                        });
+                    }
+                    catch {
+                        items.push({ key, name, isFolder: false, children: [] });
+                    }
+                }
+            }
+            return items;
+        };
+        return scanDir(this.memoryDir);
+    }
+    /**
      * 获取记忆树（用于 LLM 提示词嵌入）
      */
-    async getTreeForPrompt() {
+    async getTreeForPrompt(options) {
         const tree = await this.list();
+        const prefix = options?.prefix;
         if (Object.keys(tree).length === 0) {
             return '## 记忆目录\n\n(暂无记忆)';
         }
@@ -268,6 +415,8 @@ export class Memoir {
         const roots = new Set();
         for (const [key, value] of Object.entries(tree)) {
             if (key.startsWith('_'))
+                continue;
+            if (prefix && key !== prefix && !key.startsWith(prefix + '.'))
                 continue;
             const parts = key.split('.');
             const root = parts[0];
@@ -299,13 +448,16 @@ export class Memoir {
      * @param level - 层级 (1 = 顶层如 "life", 2 = "life.work", 以此类推)
      * @returns 该层级的所有记忆及其内容
      */
-    async getMemoriesByLevel(level) {
+    async getMemoriesByLevel(level, options) {
         const tree = await this.list();
+        const prefix = options?.prefix;
         const results = [];
         for (const [key, value] of Object.entries(tree)) {
             if (key.startsWith('_'))
                 continue;
             if (value._type !== 'file')
+                continue;
+            if (prefix && key !== prefix && !key.startsWith(prefix + '.'))
                 continue;
             const parts = key.split('.');
             if (parts.length !== level)
@@ -321,13 +473,16 @@ export class Memoir {
      * 获取简化记忆树（用于 system prompt）
      * 只包含 key、title、type，不加载内容
      */
-    async getSimpleTree() {
+    async getSimpleTree(options) {
         const tree = await this.list();
+        const prefix = options?.prefix;
         const flat = [];
         for (const [key, value] of Object.entries(tree)) {
             if (key.startsWith('_'))
                 continue;
             if (value._type !== 'file')
+                continue;
+            if (prefix && key !== prefix && !key.startsWith(prefix + '.'))
                 continue;
             flat.push({
                 key,
@@ -345,13 +500,34 @@ export class Memoir {
             collection: options.collection || 'memory',
             limit: options.limit || 10
         });
-        return results.map(r => ({
-            key: this.pathToKey(r.path),
-            title: r.title,
-            content: r.content,
-            score: r.score,
-            type: r.type
+        const now = Date.now();
+        const mapped = await Promise.all(results.map(async (r) => {
+            const key = this.pathToKey(r.path);
+            let score = r.score;
+            // 应用半衰期衰减
+            try {
+                const entry = await this.get(key);
+                const fm = entry?.frontmatter || {};
+                const halfLife = Number(fm.half_life_days);
+                if (halfLife && halfLife > 0) {
+                    const updatedAt = new Date(fm.updated_at || fm.created_at || new Date().toISOString()).getTime();
+                    const daysSince = (now - updatedAt) / (1000 * 60 * 60 * 24);
+                    const decay = Math.pow(2, -daysSince / halfLife);
+                    score = r.score * decay;
+                }
+            }
+            catch {
+                // 无法读取 frontmatter，保持原始分数
+            }
+            return {
+                key,
+                title: r.title,
+                content: r.content,
+                score,
+                type: r.type
+            };
         }));
+        return mapped.sort((a, b) => b.score - a.score);
     }
     /**
      * 获取底层 QMD 实例（高级用户）
