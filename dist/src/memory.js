@@ -17,6 +17,7 @@
  */
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import matter from 'gray-matter';
 import { QMD } from '../index.js';
 export class Memoir {
@@ -47,6 +48,9 @@ export class Memoir {
                 const count = await this.qmd.embedAll();
                 this.qmd.logEmbeddingStatus();
                 console.log(`[Memoir] Background: Done! ${count} embeddings generated`);
+                // 启动文件监听，捕获外部修改和 set() 遗漏的 embedding
+                this.qmd.startAutoEmbed({ interval: 120000, debounce: 3000 });
+                console.log('[Memoir] Auto-embed watcher started');
             })
                 .catch((err) => {
                 console.warn('[Memoir] Background embed failed:', err?.message || err);
@@ -212,6 +216,17 @@ export class Memoir {
         const raw = matter.stringify(content, frontmatter);
         await fs.promises.writeFile(file, raw, 'utf-8');
         await this.qmd.reindex();
+        // 及时 embedding：reindex 后立即对该文档生成向量（非阻塞）
+        if (this.qmd.isEmbeddingModelLoaded()) {
+            const hash = crypto.createHash('md5').update(content).digest('hex');
+            this.qmd.embedDocument(content)
+                .then(async (embedding) => {
+                if (embedding) {
+                    await this.qmd.insertEmbedding(hash, 0, 0, embedding);
+                }
+            })
+                .catch(() => { });
+        }
         return { key, file };
     }
     /**

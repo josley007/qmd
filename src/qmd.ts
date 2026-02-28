@@ -260,12 +260,22 @@ export class QMDStore {
     const id = this.getDocid(hash, docPath)
 
     // Check if document exists
-    const existing = db.prepare('SELECT id FROM documents WHERE collection_id = ? AND path = ?').get(collectionId, docPath)
+    const existing = db.prepare('SELECT id, hash FROM documents WHERE collection_id = ? AND path = ?').get(collectionId, docPath) as { id: string; hash: string } | undefined
 
     if (existing) {
+      // Clean up orphaned embeddings when content hash changes
+      if (existing.hash && existing.hash !== hash) {
+        const otherRefs = (db.prepare(
+          'SELECT COUNT(*) as count FROM documents WHERE hash = ? AND NOT (collection_id = ? AND path = ?)'
+        ).get(existing.hash, collectionId, docPath) as any)?.count || 0
+        if (otherRefs === 0) {
+          db.prepare('DELETE FROM content_vectors WHERE hash = ?').run(existing.hash)
+          db.prepare('DELETE FROM vectors_vec WHERE hash_seq LIKE ?').run(existing.hash + '_%')
+        }
+      }
       // Update
       db.prepare(`
-        UPDATE documents 
+        UPDATE documents
         SET title = ?, content = ?, hash = ?, frontmatter = ?, updated_at = CURRENT_TIMESTAMP
         WHERE collection_id = ? AND path = ?
       `).run(title, content, hash, JSON.stringify(frontmatter), collectionId, docPath)
@@ -1451,8 +1461,10 @@ export class QMDStore {
       // Total documents
       const total = (db.prepare('SELECT COUNT(*) as count FROM documents WHERE active = 1').get() as any)?.count || 0
       
-      // Documents with embeddings
-      const embedded = (db.prepare('SELECT COUNT(DISTINCT hash) as count FROM content_vectors').get() as any)?.count || 0
+      // Documents with embeddings (only count active documents)
+      const embedded = (db.prepare(
+        'SELECT COUNT(DISTINCT cv.hash) as count FROM content_vectors cv JOIN documents d ON d.hash = cv.hash AND d.active = 1'
+      ).get() as any)?.count || 0
       
       // Pending
       const pending = total - embedded
