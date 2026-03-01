@@ -23,6 +23,22 @@ export interface SearchResult {
   source?: 'bm25' | 'vec' | 'hybrid'
 }
 
+/**
+ * Sanitize a term for FTS5 query to prevent injection.
+ * Removes characters that have special meaning in FTS5: " * ^
+ */
+function sanitizeFtsTerm(term: string): string {
+  return term.replace(/["*^\\]/g, '')
+}
+
+/**
+ * Escape special LIKE wildcard characters (% and _) in a string.
+ * Use with `ESCAPE '\'` clause.
+ */
+function escapeLikePattern(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+}
+
 export class QMDStore {
   private db: BetterSqlite3.Database | null = null
   private dbPath: string
@@ -36,7 +52,8 @@ export class QMDStore {
   private embeddingContextInstance: any = null
   private rerankModelInstance: any = null
   private rerankContextInstance: any = null
-  private modelLoading: Promise<any> | null = null
+  private embeddingModelLoading: Promise<any> | null = null
+  private rerankModelLoading: Promise<any> | null = null
 
   constructor(private dataDir: string = './qmd-data') {
     this.dbPath = path.join(dataDir, 'index.sqlite')
@@ -185,8 +202,8 @@ export class QMDStore {
       
       if (tableInfo) {
         const match = tableInfo.sql?.match(/float\[(\d+)\]/)
-        const existingDims = match?.[1] ? parseInt(match[1], 10) : null
-        if (existingDims === dimensions) return
+        const existingDims = match?.[1] != null ? parseInt(match[1], 10) : null
+        if (existingDims !== null && existingDims === dimensions) return
         
         this.db.exec("DROP TABLE IF EXISTS vectors_vec")
       }
@@ -270,7 +287,8 @@ export class QMDStore {
         ).get(existing.hash, collectionId, docPath) as any)?.count || 0
         if (otherRefs === 0) {
           db.prepare('DELETE FROM content_vectors WHERE hash = ?').run(existing.hash)
-          db.prepare('DELETE FROM vectors_vec WHERE hash_seq LIKE ?').run(existing.hash + '_%')
+          db.prepare("DELETE FROM vectors_vec WHERE hash_seq LIKE ? ESCAPE '\\'").run(escapeLikePattern(existing.hash) + '\\_%')
+          db.prepare('DELETE FROM content WHERE hash = ?').run(existing.hash)
         }
       }
       // Update
@@ -300,7 +318,7 @@ export class QMDStore {
         SELECT d.rowid, d.title, d.content FROM documents d WHERE d.hash = ?
       `).run(hash)
     } catch (e) {
-      // Ignore FTS errors
+      console.warn('[QMD] FTS sync failed:', e)
     }
 
     return id
@@ -333,7 +351,11 @@ export class QMDStore {
     const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0)
     if (terms.length === 0) return []
 
-    const ftsQuery = terms.map(t => `"${t}"*`).join(' AND ')
+    const ftsQuery = terms.map(t => {
+      const sanitized = sanitizeFtsTerm(t)
+      return sanitized ? `"${sanitized}"*` : null
+    }).filter(Boolean).join(' AND ')
+    if (!ftsQuery) return []
     console.log(`[QMD] BM25 search: query="${query}", fts="${ftsQuery}"`)
 
     let sql = `
@@ -384,20 +406,24 @@ export class QMDStore {
     const result = { indexed: 0, skipped: 0, failed: 0 }
     const collections = this.listCollections()
 
+    const db = this.getDb()
+
     for (const collection of collections) {
       console.log(`[Store] Indexing collection "${collection.name}"`)
 
       // Find all markdown files in the collection path
       const files = this.findMarkdownFiles(collection.path, collection.glob)
+      const seenPaths = new Set<string>()
 
       for (const filePath of files) {
         try {
           const relativePath = path.relative(collection.path, filePath)
+          seenPaths.add(relativePath)
           const content = fs.readFileSync(filePath, 'utf-8')
           const parsed = matter(content)
-          
+
           const title = parsed.data.title || path.basename(filePath, '.md')
-          
+
           this.upsertDocument(
             collection.id,
             relativePath,
@@ -410,6 +436,18 @@ export class QMDStore {
         } catch (err) {
           console.error(`[Store] Failed to index ${filePath}:`, err)
           result.failed++
+        }
+      }
+
+      // Mark documents that no longer exist on disk as inactive
+      const activeDocs = db.prepare(
+        'SELECT path FROM documents WHERE collection_id = ? AND active = 1'
+      ).all(collection.id) as { path: string }[]
+
+      for (const doc of activeDocs) {
+        if (!seenPaths.has(doc.path)) {
+          db.prepare('UPDATE documents SET active = 0 WHERE collection_id = ? AND path = ?')
+            .run(collection.id, doc.path)
         }
       }
     }
@@ -1006,15 +1044,15 @@ export class QMDStore {
     if (this.rerankContextInstance) {
       return
     }
-    
-    if (this.modelLoading) {
-      await this.modelLoading
+
+    if (this.rerankModelLoading) {
+      await this.rerankModelLoading
       return
     }
-    
-    this.modelLoading = this.loadRerankModel()
-    await this.modelLoading
-    this.modelLoading = null
+
+    this.rerankModelLoading = this.loadRerankModel()
+    await this.rerankModelLoading
+    this.rerankModelLoading = null
   }
 
   /**
@@ -1103,17 +1141,17 @@ export class QMDStore {
     if (this.embeddingContextInstance) {
       return
     }
-    
+
     // If loading in progress, wait for it
-    if (this.modelLoading) {
-      await this.modelLoading
+    if (this.embeddingModelLoading) {
+      await this.embeddingModelLoading
       return
     }
-    
+
     // Start loading
-    this.modelLoading = this.loadEmbeddingModel()
-    await this.modelLoading
-    this.modelLoading = null
+    this.embeddingModelLoading = this.loadEmbeddingModel()
+    await this.embeddingModelLoading
+    this.embeddingModelLoading = null
   }
 
   /**
@@ -1309,6 +1347,7 @@ export class QMDStore {
   private fileWatcher: any = null
   private autoEmbedTimer: NodeJS.Timeout | null = null
   private isWatching: boolean = false
+  private pendingChanges: Map<string, NodeJS.Timeout> = new Map()
 
   /**
    * Start watching collections for file changes and auto-embed
@@ -1328,7 +1367,6 @@ export class QMDStore {
 
     const interval = options?.interval ?? 60000
     const debounce = options?.debounce ?? 2000
-    const pendingChanges = new Map<string, NodeJS.Timeout>()
 
     // Get all collection paths
     const getCollectionPaths = (): string[] => {
@@ -1394,11 +1432,13 @@ export class QMDStore {
         this.fileWatcher.on('add', (path: string) => {
           console.log(`[QMD] File added: ${path}`)
           options?.onChange?.('add', path)
-          
-          // Debounce embedding
+
+          // Debounce embedding - clear old timer for same key before setting new one
           const key = `add:${path}`
-          pendingChanges.set(key, setTimeout(() => {
-            pendingChanges.delete(key)
+          const oldTimer = this.pendingChanges.get(key)
+          if (oldTimer) clearTimeout(oldTimer)
+          this.pendingChanges.set(key, setTimeout(() => {
+            this.pendingChanges.delete(key)
             scanAndEmbed()
           }, debounce))
         })
@@ -1406,10 +1446,12 @@ export class QMDStore {
         this.fileWatcher.on('change', (path: string) => {
           console.log(`[QMD] File changed: ${path}`)
           options?.onChange?.('change', path)
-          
+
           const key = `change:${path}`
-          pendingChanges.set(key, setTimeout(() => {
-            pendingChanges.delete(key)
+          const oldTimer = this.pendingChanges.get(key)
+          if (oldTimer) clearTimeout(oldTimer)
+          this.pendingChanges.set(key, setTimeout(() => {
+            this.pendingChanges.delete(key)
             scanAndEmbed()
           }, debounce))
         })
@@ -1423,14 +1465,20 @@ export class QMDStore {
         console.log('[QMD] Using periodic scanning (no file watcher)')
       }
 
-      // Start periodic scan
-      this.autoEmbedTimer = setInterval(scanAndEmbed, interval)
+      // Start periodic scan using setTimeout self-scheduling (backpressure-safe)
+      const scheduleNext = () => {
+        this.autoEmbedTimer = setTimeout(async () => {
+          await scanAndEmbed()
+          if (this.isWatching) scheduleNext()
+        }, interval)
+      }
       this.isWatching = true
-      
+      scheduleNext()
+
       console.log(`[QMD] Auto-embed started (interval: ${interval}ms)`)
     }
 
-    startWatching()
+    startWatching().catch(err => console.error('[QMD] startWatching failed:', err))
   }
 
   /**
@@ -1438,7 +1486,7 @@ export class QMDStore {
    */
   stopAutoEmbed(): void {
     if (this.autoEmbedTimer) {
-      clearInterval(this.autoEmbedTimer)
+      clearTimeout(this.autoEmbedTimer)
       this.autoEmbedTimer = null
     }
 
@@ -1446,6 +1494,12 @@ export class QMDStore {
       this.fileWatcher.close?.()
       this.fileWatcher = null
     }
+
+    // Clear all pending debounce timers
+    for (const timer of this.pendingChanges.values()) {
+      clearTimeout(timer)
+    }
+    this.pendingChanges.clear()
 
     this.isWatching = false
     console.log('[QMD] Auto-embed stopped')

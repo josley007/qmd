@@ -184,13 +184,15 @@ function createMcpServer(store: Store): McpServer {
 
       // Try suffix match if exact match fails
       if (!doc) {
+        // Escape LIKE wildcards in user-provided path to prevent unintended pattern matching
+        const escapedPath = relativePath.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
         doc = store.db.prepare(`
           SELECT d.collection, d.path, d.title, c.doc as body
           FROM documents d
           JOIN content c ON c.hash = d.hash
-          WHERE d.path LIKE ? AND d.active = 1
+          WHERE d.path LIKE ? ESCAPE '\\' AND d.active = 1
           LIMIT 1
-        `).get(`%${relativePath}`) as { collection: string; path: string; title: string; body: string } | null;
+        `).get(`%${escapedPath}`) as { collection: string; path: string; title: string; body: string } | null;
       }
 
       if (!doc) {

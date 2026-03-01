@@ -11,6 +11,20 @@ import fs from 'fs';
 import crypto from 'crypto';
 import matter from 'gray-matter';
 import * as sqliteVec from 'sqlite-vec';
+/**
+ * Sanitize a term for FTS5 query to prevent injection.
+ * Removes characters that have special meaning in FTS5: " * ^
+ */
+function sanitizeFtsTerm(term) {
+    return term.replace(/["*^\\]/g, '');
+}
+/**
+ * Escape special LIKE wildcard characters (% and _) in a string.
+ * Use with `ESCAPE '\'` clause.
+ */
+function escapeLikePattern(value) {
+    return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
 export class QMDStore {
     dataDir;
     db = null;
@@ -24,7 +38,8 @@ export class QMDStore {
     embeddingContextInstance = null;
     rerankModelInstance = null;
     rerankContextInstance = null;
-    modelLoading = null;
+    embeddingModelLoading = null;
+    rerankModelLoading = null;
     constructor(dataDir = './qmd-data') {
         this.dataDir = dataDir;
         this.dbPath = path.join(dataDir, 'index.sqlite');
@@ -159,8 +174,8 @@ export class QMDStore {
             const tableInfo = this.db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
             if (tableInfo) {
                 const match = tableInfo.sql?.match(/float\[(\d+)\]/);
-                const existingDims = match?.[1] ? parseInt(match[1], 10) : null;
-                if (existingDims === dimensions)
+                const existingDims = match?.[1] != null ? parseInt(match[1], 10) : null;
+                if (existingDims !== null && existingDims === dimensions)
                     return;
                 this.db.exec("DROP TABLE IF EXISTS vectors_vec");
             }
@@ -234,7 +249,8 @@ export class QMDStore {
                 const otherRefs = db.prepare('SELECT COUNT(*) as count FROM documents WHERE hash = ? AND NOT (collection_id = ? AND path = ?)').get(existing.hash, collectionId, docPath)?.count || 0;
                 if (otherRefs === 0) {
                     db.prepare('DELETE FROM content_vectors WHERE hash = ?').run(existing.hash);
-                    db.prepare('DELETE FROM vectors_vec WHERE hash_seq LIKE ?').run(existing.hash + '_%');
+                    db.prepare("DELETE FROM vectors_vec WHERE hash_seq LIKE ? ESCAPE '\\'").run(escapeLikePattern(existing.hash) + '\\_%');
+                    db.prepare('DELETE FROM content WHERE hash = ?').run(existing.hash);
                 }
             }
             // Update
@@ -264,7 +280,7 @@ export class QMDStore {
       `).run(hash);
         }
         catch (e) {
-            // Ignore FTS errors
+            console.warn('[QMD] FTS sync failed:', e);
         }
         return id;
     }
@@ -292,7 +308,12 @@ export class QMDStore {
         const terms = query.toLowerCase().split(/\s+/).filter(t => t.length > 0);
         if (terms.length === 0)
             return [];
-        const ftsQuery = terms.map(t => `"${t}"*`).join(' AND ');
+        const ftsQuery = terms.map(t => {
+            const sanitized = sanitizeFtsTerm(t);
+            return sanitized ? `"${sanitized}"*` : null;
+        }).filter(Boolean).join(' AND ');
+        if (!ftsQuery)
+            return [];
         console.log(`[QMD] BM25 search: query="${query}", fts="${ftsQuery}"`);
         let sql = `
       SELECT
@@ -335,13 +356,16 @@ export class QMDStore {
     async indexAll(options = {}) {
         const result = { indexed: 0, skipped: 0, failed: 0 };
         const collections = this.listCollections();
+        const db = this.getDb();
         for (const collection of collections) {
             console.log(`[Store] Indexing collection "${collection.name}"`);
             // Find all markdown files in the collection path
             const files = this.findMarkdownFiles(collection.path, collection.glob);
+            const seenPaths = new Set();
             for (const filePath of files) {
                 try {
                     const relativePath = path.relative(collection.path, filePath);
+                    seenPaths.add(relativePath);
                     const content = fs.readFileSync(filePath, 'utf-8');
                     const parsed = matter(content);
                     const title = parsed.data.title || path.basename(filePath, '.md');
@@ -351,6 +375,14 @@ export class QMDStore {
                 catch (err) {
                     console.error(`[Store] Failed to index ${filePath}:`, err);
                     result.failed++;
+                }
+            }
+            // Mark documents that no longer exist on disk as inactive
+            const activeDocs = db.prepare('SELECT path FROM documents WHERE collection_id = ? AND active = 1').all(collection.id);
+            for (const doc of activeDocs) {
+                if (!seenPaths.has(doc.path)) {
+                    db.prepare('UPDATE documents SET active = 0 WHERE collection_id = ? AND path = ?')
+                        .run(collection.id, doc.path);
                 }
             }
         }
@@ -848,13 +880,13 @@ export class QMDStore {
         if (this.rerankContextInstance) {
             return;
         }
-        if (this.modelLoading) {
-            await this.modelLoading;
+        if (this.rerankModelLoading) {
+            await this.rerankModelLoading;
             return;
         }
-        this.modelLoading = this.loadRerankModel();
-        await this.modelLoading;
-        this.modelLoading = null;
+        this.rerankModelLoading = this.loadRerankModel();
+        await this.rerankModelLoading;
+        this.rerankModelLoading = null;
     }
     /**
      * Load rerank model
@@ -931,14 +963,14 @@ export class QMDStore {
             return;
         }
         // If loading in progress, wait for it
-        if (this.modelLoading) {
-            await this.modelLoading;
+        if (this.embeddingModelLoading) {
+            await this.embeddingModelLoading;
             return;
         }
         // Start loading
-        this.modelLoading = this.loadEmbeddingModel();
-        await this.modelLoading;
-        this.modelLoading = null;
+        this.embeddingModelLoading = this.loadEmbeddingModel();
+        await this.embeddingModelLoading;
+        this.embeddingModelLoading = null;
     }
     /**
      * Load the embedding model
@@ -1102,6 +1134,7 @@ export class QMDStore {
     fileWatcher = null;
     autoEmbedTimer = null;
     isWatching = false;
+    pendingChanges = new Map();
     /**
      * Start watching collections for file changes and auto-embed
      * @param options.interval - Scan interval in ms (default: 60000 = 1 minute)
@@ -1115,7 +1148,6 @@ export class QMDStore {
         }
         const interval = options?.interval ?? 60000;
         const debounce = options?.debounce ?? 2000;
-        const pendingChanges = new Map();
         // Get all collection paths
         const getCollectionPaths = () => {
             const db = this.getDb();
@@ -1173,10 +1205,13 @@ export class QMDStore {
                 this.fileWatcher.on('add', (path) => {
                     console.log(`[QMD] File added: ${path}`);
                     options?.onChange?.('add', path);
-                    // Debounce embedding
+                    // Debounce embedding - clear old timer for same key before setting new one
                     const key = `add:${path}`;
-                    pendingChanges.set(key, setTimeout(() => {
-                        pendingChanges.delete(key);
+                    const oldTimer = this.pendingChanges.get(key);
+                    if (oldTimer)
+                        clearTimeout(oldTimer);
+                    this.pendingChanges.set(key, setTimeout(() => {
+                        this.pendingChanges.delete(key);
                         scanAndEmbed();
                     }, debounce));
                 });
@@ -1184,8 +1219,11 @@ export class QMDStore {
                     console.log(`[QMD] File changed: ${path}`);
                     options?.onChange?.('change', path);
                     const key = `change:${path}`;
-                    pendingChanges.set(key, setTimeout(() => {
-                        pendingChanges.delete(key);
+                    const oldTimer = this.pendingChanges.get(key);
+                    if (oldTimer)
+                        clearTimeout(oldTimer);
+                    this.pendingChanges.set(key, setTimeout(() => {
+                        this.pendingChanges.delete(key);
                         scanAndEmbed();
                     }, debounce));
                 });
@@ -1198,25 +1236,37 @@ export class QMDStore {
                 // Fallback: use setInterval for periodic scanning
                 console.log('[QMD] Using periodic scanning (no file watcher)');
             }
-            // Start periodic scan
-            this.autoEmbedTimer = setInterval(scanAndEmbed, interval);
+            // Start periodic scan using setTimeout self-scheduling (backpressure-safe)
+            const scheduleNext = () => {
+                this.autoEmbedTimer = setTimeout(async () => {
+                    await scanAndEmbed();
+                    if (this.isWatching)
+                        scheduleNext();
+                }, interval);
+            };
             this.isWatching = true;
+            scheduleNext();
             console.log(`[QMD] Auto-embed started (interval: ${interval}ms)`);
         };
-        startWatching();
+        startWatching().catch(err => console.error('[QMD] startWatching failed:', err));
     }
     /**
      * Stop watching and auto-embedding
      */
     stopAutoEmbed() {
         if (this.autoEmbedTimer) {
-            clearInterval(this.autoEmbedTimer);
+            clearTimeout(this.autoEmbedTimer);
             this.autoEmbedTimer = null;
         }
         if (this.fileWatcher) {
             this.fileWatcher.close?.();
             this.fileWatcher = null;
         }
+        // Clear all pending debounce timers
+        for (const timer of this.pendingChanges.values()) {
+            clearTimeout(timer);
+        }
+        this.pendingChanges.clear();
         this.isWatching = false;
         console.log('[QMD] Auto-embed stopped');
     }

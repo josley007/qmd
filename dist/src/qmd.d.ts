@@ -27,7 +27,8 @@ export declare class QMDStore {
     private embeddingContextInstance;
     private rerankModelInstance;
     private rerankContextInstance;
-    private modelLoading;
+    private embeddingModelLoading;
+    private rerankModelLoading;
     constructor(dataDir?: string);
     /**
      * Initialize the database
@@ -279,6 +280,7 @@ export declare class QMDStore {
     private fileWatcher;
     private autoEmbedTimer;
     private isWatching;
+    private pendingChanges;
     /**
      * Start watching collections for file changes and auto-embed
      * @param options.interval - Scan interval in ms (default: 60000 = 1 minute)

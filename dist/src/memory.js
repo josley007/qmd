@@ -24,6 +24,7 @@ export class Memoir {
     qmd;
     memoryDir;
     zones = [];
+    keyLocks = new Map();
     constructor(options = {}) {
         this.memoryDir = options.memoryDir || './memory';
         this.qmd = new QMD({ dataDir: options.dataDir || './memoir-data' });
@@ -43,7 +44,11 @@ export class Memoir {
         // 后台异步生成 embedding (不阻塞启动)
         if (autoEmbed) {
             console.log('[Memoir] Background: Generating embeddings...');
-            this.qmd.preloadEmbeddingModel()
+            const MODEL_LOAD_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+            Promise.race([
+                this.qmd.preloadEmbeddingModel(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Embedding model load timed out after 5 minutes')), MODEL_LOAD_TIMEOUT))
+            ])
                 .then(async () => {
                 const count = await this.qmd.embedAll();
                 this.qmd.logEmbeddingStatus();
@@ -75,6 +80,23 @@ export class Memoir {
     defineZone(name, options) {
         this.zones = this.zones.filter(z => z.name !== name);
         this.zones.push({ name, ...options });
+    }
+    /**
+     * Per-key lock to prevent concurrent set/delete from overwriting each other's metadata
+     */
+    async withKeyLock(key, fn) {
+        // Wait for any existing operation on this key
+        while (this.keyLocks.has(key)) {
+            await this.keyLocks.get(key);
+        }
+        const promise = fn();
+        this.keyLocks.set(key, promise.catch(() => { }));
+        try {
+            return await promise;
+        }
+        finally {
+            this.keyLocks.delete(key);
+        }
     }
     /**
      * 查找匹配 key 的 zone
@@ -130,8 +152,23 @@ export class Memoir {
      */
     keyToPath(key) {
         const parts = key.split('.').map(p => p.trim()).filter(p => p);
+        // Validate each segment to prevent path traversal
+        for (const segment of parts) {
+            if (segment === '..' || segment.includes('/') || segment.includes('\\')) {
+                throw new Error(`Invalid key segment "${segment}": must not contain "..", "/", or "\\"`);
+            }
+        }
+        if (parts.length === 0) {
+            throw new Error('Key must not be empty');
+        }
         const fileName = parts[parts.length - 1] + '.md';
         const dirPath = parts.slice(0, -1).join('/');
+        const resolvedFile = path.resolve(this.memoryDir, dirPath, fileName);
+        const resolvedMemDir = path.resolve(this.memoryDir);
+        // Final check: resolved path must be inside memoryDir
+        if (!resolvedFile.startsWith(resolvedMemDir + path.sep) && resolvedFile !== resolvedMemDir) {
+            throw new Error(`Key "${key}" resolves outside memory directory`);
+        }
         return {
             dir: path.join(this.memoryDir, dirPath),
             file: path.join(this.memoryDir, dirPath, fileName),
@@ -158,6 +195,9 @@ export class Memoir {
      * 添加或更新记忆
      */
     async set(key, content, metadata = {}) {
+        return this.withKeyLock(key, () => this._setImpl(key, content, metadata));
+    }
+    async _setImpl(key, content, metadata) {
         const { dir, file, parts } = this.keyToPath(key);
         // Zone 校验
         const zone = this.findZone(key);
@@ -217,15 +257,24 @@ export class Memoir {
         await fs.promises.writeFile(file, raw, 'utf-8');
         await this.qmd.reindex();
         // 及时 embedding：reindex 后立即对该文档生成向量（非阻塞）
+        // Re-read and parse the file to compute the same hash that reindex uses (gray-matter parsed content)
         if (this.qmd.isEmbeddingModelLoaded()) {
-            const hash = crypto.createHash('md5').update(content).digest('hex');
-            this.qmd.embedDocument(content)
-                .then(async (embedding) => {
-                if (embedding) {
-                    await this.qmd.insertEmbedding(hash, 0, 0, embedding);
-                }
-            })
-                .catch(() => { });
+            try {
+                const writtenRaw = await fs.promises.readFile(file, 'utf-8');
+                const writtenParsed = matter(writtenRaw);
+                const parsedContent = writtenParsed.content;
+                const hash = crypto.createHash('md5').update(parsedContent).digest('hex');
+                this.qmd.embedDocument(parsedContent)
+                    .then(async (embedding) => {
+                    if (embedding) {
+                        await this.qmd.insertEmbedding(hash, 0, 0, embedding);
+                    }
+                })
+                    .catch(() => { });
+            }
+            catch {
+                /* auto-embed 兜底 */
+            }
         }
         return { key, file };
     }
@@ -251,6 +300,9 @@ export class Memoir {
      * 删除记忆
      */
     async delete(key) {
+        return this.withKeyLock(key, () => this._deleteImpl(key));
+    }
+    async _deleteImpl(key) {
         const possiblePaths = [];
         // Standard keyToPath (treats all . as path separators)
         const { file: file1 } = this.keyToPath(key);

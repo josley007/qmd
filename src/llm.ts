@@ -369,6 +369,7 @@ export class LlamaCpp implements LLM {
   private embedContextCreatePromise: Promise<LlamaEmbeddingContext> | null = null;
   private generateModelLoadPromise: Promise<LlamaModel> | null = null;
   private rerankModelLoadPromise: Promise<LlamaModel> | null = null;
+  private rerankContextCreatePromise: Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>> | null = null;
 
   // Inactivity timer for auto-unloading models
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
@@ -625,11 +626,30 @@ export class LlamaCpp implements LLM {
 
   /**
    * Load rerank context (lazy). Context can be disposed and recreated without reloading the model.
+   * Uses promise guard to prevent concurrent context creation race condition.
    */
   private async ensureRerankContext(): Promise<Awaited<ReturnType<LlamaModel["createRankingContext"]>>> {
     if (!this.rerankContext) {
-      const model = await this.ensureRerankModel();
-      this.rerankContext = await model.createRankingContext();
+      // If context creation is already in progress, wait for it
+      if (this.rerankContextCreatePromise) {
+        return await this.rerankContextCreatePromise;
+      }
+
+      // Start context creation and store promise so concurrent calls wait
+      this.rerankContextCreatePromise = (async () => {
+        const model = await this.ensureRerankModel();
+        const context = await model.createRankingContext();
+        this.rerankContext = context;
+        return context;
+      })();
+
+      try {
+        const context = await this.rerankContextCreatePromise;
+        this.touchActivity();
+        return context;
+      } finally {
+        this.rerankContextCreatePromise = null;
+      }
     }
     this.touchActivity();
     return this.rerankContext;
@@ -881,27 +901,39 @@ export class LlamaCpp implements LLM {
 
     const context = await this.ensureRerankContext();
 
-    // Build a map from document text to original indices (for lookup after sorting)
-    const textToDoc = new Map<string, { file: string; index: number }>();
+    // Build a map from document text to all original indices (handles duplicate texts)
+    const textToIndices = new Map<string, number[]>();
     documents.forEach((doc, index) => {
-      textToDoc.set(doc.text, { file: doc.file, index });
+      const existing = textToIndices.get(doc.text);
+      if (existing) {
+        existing.push(index);
+      } else {
+        textToIndices.set(doc.text, [index]);
+      }
     });
 
-    // Extract just the text for ranking
-    const texts = documents.map((doc) => doc.text);
+    // Deduplicate texts for ranking (rankAndSort only needs unique texts)
+    const uniqueTexts = Array.from(textToIndices.keys());
 
     // Use the proper ranking API - returns [{document: string, score: number}] sorted by score
-    const ranked = await context.rankAndSort(query, texts);
+    const ranked = await context.rankAndSort(query, uniqueTexts);
 
-    // Map back to our result format using the text-to-doc map
-    const results: RerankDocumentResult[] = ranked.map((item) => {
-      const docInfo = textToDoc.get(item.document)!;
-      return {
-        file: docInfo.file,
-        score: item.score,
-        index: docInfo.index,
-      };
-    });
+    // Map back to our result format, expanding duplicate texts back to all original indices
+    const consumedIndices = new Set<number>();
+    const results: RerankDocumentResult[] = [];
+    for (const item of ranked) {
+      const indices = textToIndices.get(item.document);
+      if (!indices) continue;
+      for (const idx of indices) {
+        if (consumedIndices.has(idx)) continue;
+        consumedIndices.add(idx);
+        results.push({
+          file: documents[idx].file,
+          score: item.score,
+          index: idx,
+        });
+      }
+    }
 
     return {
       results,
@@ -944,6 +976,7 @@ export class LlamaCpp implements LLM {
     this.embedContextCreatePromise = null;
     this.generateModelLoadPromise = null;
     this.rerankModelLoadPromise = null;
+    this.rerankContextCreatePromise = null;
   }
 }
 

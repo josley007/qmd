@@ -60,6 +60,7 @@ export declare class Memoir {
     private qmd;
     private memoryDir;
     private zones;
+    private keyLocks;
     constructor(options?: {
         memoryDir?: string;
         dataDir?: string;
@@ -77,6 +78,10 @@ export declare class Memoir {
      * 定义一个记忆 zone
      */
     defineZone(name: string, options: Omit<MemoryZone, 'name'>): void;
+    /**
+     * Per-key lock to prevent concurrent set/delete from overwriting each other's metadata
+     */
+    private withKeyLock;
     /**
      * 查找匹配 key 的 zone
      */
@@ -111,6 +116,7 @@ export declare class Memoir {
         key: string;
         file: string;
     }>;
+    private _setImpl;
     /**
      * 获取记忆
      */
@@ -119,6 +125,7 @@ export declare class Memoir {
      * 删除记忆
      */
     delete(key: string): Promise<boolean>;
+    private _deleteImpl;
     /**
      * 列出所有记忆（树状结构）
      */
