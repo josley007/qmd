@@ -878,9 +878,11 @@ export class QMDStore {
     const embeddedAt = new Date().toISOString()
 
     try {
-      db.prepare(`INSERT OR REPLACE INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
+      // sqlite-vec virtual tables don't support INSERT OR REPLACE, so delete first
+      db.prepare(`DELETE FROM vectors_vec WHERE hash_seq = ?`).run(hashSeq)
+      db.prepare(`INSERT INTO vectors_vec (hash_seq, embedding) VALUES (?, ?)`)
         .run(hashSeq, new Float32Array(embedding))
-      
+
       db.prepare(`INSERT OR REPLACE INTO content_vectors (hash, seq, pos, model, embedded_at) VALUES (?, ?, ?, ?, ?)`)
         .run(hash, seq, pos, this.embeddingModel, embeddedAt)
     } catch (err) {
