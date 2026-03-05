@@ -65,7 +65,12 @@ export class QMDStore {
         if (!this.db)
             return;
         try {
-            sqliteVec.load(this.db);
+            // In packaged Electron apps, sqlite-vec resolves vec0.dll via import.meta.url
+            // which points inside app.asar. The native loadExtension() call can't read from
+            // asar archives, so we fix the path to point to the unpacked directory.
+            let extPath = sqliteVec.getLoadablePath();
+            extPath = extPath.replace(/app\.asar([\\/])/, 'app.asar.unpacked$1');
+            this.db.loadExtension(extPath);
             console.log('[QMD] sqlite-vec extension loaded');
         }
         catch (err) {
