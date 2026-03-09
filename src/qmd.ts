@@ -1097,10 +1097,10 @@ export class QMDStore {
     
     try {
       if (!this.llamaInstance) {
-        const { getLlama } = await import('node-llama-cpp')
-        this.llamaInstance = await getLlama()
+        const { getLlama, LlamaLogLevel } = await import('node-llama-cpp')
+        this.llamaInstance = await getLlama({ logLevel: LlamaLogLevel.error })
       }
-      
+
       this.rerankModelInstance = await this.llamaInstance.loadModel({
         modelPath: modelPath,
       })
@@ -1198,9 +1198,9 @@ export class QMDStore {
     console.log(`[QMD] Loading embedding model: ${modelPath}...`)
     
     try {
-      const { getLlama } = await import('node-llama-cpp')
-      
-      this.llamaInstance = await getLlama()
+      const { getLlama, LlamaLogLevel } = await import('node-llama-cpp')
+
+      this.llamaInstance = await getLlama({ logLevel: LlamaLogLevel.error })
       console.log('[QMD] Llama instance ready')
       
       this.embeddingModelInstance = await this.llamaInstance.loadModel({

@@ -135,6 +135,9 @@ export declare class QMDStore {
         };
         rrfK?: number;
         enableRerank?: boolean;
+        rerankMaxCandidates?: number;
+        rerankTimeoutMs?: number;
+        rerankMinScore?: number;
     }): Promise<SearchResult[]>;
     /**
      * Rerank using reranker model

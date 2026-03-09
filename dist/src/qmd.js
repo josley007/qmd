@@ -508,10 +508,16 @@ export class QMDStore {
         const weights = options?.weights || { bm25: 1.0, vec: 1.0 };
         const rrfK = options?.rrfK || 60;
         const enableRerank = options?.enableRerank !== false; // 默认开启
+        // Cap candidates sent to reranker to prevent CPU stalls
+        const rerankMaxCandidates = Math.max(4, Math.min(options?.rerankMaxCandidates || 16, 32));
+        const rerankTimeoutMs = options?.rerankTimeoutMs || 5000;
+        const rerankMinScore = options?.rerankMinScore ?? 0.3;
+        // Fetch multiplier: limit * 2 is sufficient for RRF diversity (was limit * 4)
+        const fetchLimit = Math.min(limit * 2, 50);
         // Run BM25 and Vector searches in parallel
         const [bm25Results, vecResults] = await Promise.all([
-            this.searchBM25(query, collectionName, limit * 4),
-            this.searchVec(embedding, collectionName, limit * 4).catch(() => [])
+            this.searchBM25(query, collectionName, fetchLimit),
+            this.searchVec(embedding, collectionName, fetchLimit).catch(() => [])
         ]);
         // If only one source has results, return directly with proper scores
         if (bm25Results.length > 0 && vecResults.length === 0) {
@@ -527,28 +533,33 @@ export class QMDStore {
             return [];
         }
         // Both sources have results - use RRF
-        const candidates = this.rrfCombine(bm25Results, vecResults, weights, rrfK, limit * 4);
+        const candidates = this.rrfCombine(bm25Results, vecResults, weights, rrfK, fetchLimit);
         console.log(`[QMD] RRF combined: ${candidates.length} candidates`, candidates.slice(0, 5).map(c => ({ path: c.path, score: c.score.toFixed(4) })));
         // If no reranking needed, return directly
         if (!enableRerank || (!embedding && !options?.rerank)) {
             return candidates.slice(0, limit);
         }
+        // Filter low-score candidates, then cap
+        const qualifiedCandidates = candidates.filter(c => c.score >= rerankMinScore);
+        const rerankCandidates = qualifiedCandidates.slice(0, rerankMaxCandidates);
+        if (rerankCandidates.length < candidates.length) {
+            console.log(`[QMD] Rerank filter: ${candidates.length} → ${rerankCandidates.length} (minScore=${rerankMinScore}, max=${rerankMaxCandidates})`);
+        }
         // Reranking
         let finalResults = [];
-        // 优先使用 reranker 模型
+        // 优先使用 reranker 模型 (with timeout protection)
         if (this.rerankContextInstance) {
             try {
-                console.log('[QMD] Using reranker model for re-ranking...');
-                finalResults = await this.rerankWithModel(query, candidates, limit);
+                console.log(`[QMD] Using reranker model for re-ranking (${rerankCandidates.length} candidates, timeout ${rerankTimeoutMs}ms)...`);
+                finalResults = await Promise.race([
+                    this.rerankWithModel(query, rerankCandidates, limit),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error(`Reranker timed out after ${rerankTimeoutMs}ms`)), rerankTimeoutMs))
+                ]);
             }
             catch (err) {
-                console.warn('[QMD] Reranker failed, fallback to embedding rerank:', err);
-                if (embedding && embedding.length > 0) {
-                    finalResults = await this.rerankWithEmbedding(query, embedding, candidates, limit);
-                }
-                else {
-                    finalResults = this.rerankWithKeywords(query, candidates, limit);
-                }
+                // Timeout or failure — return RRF-ordered candidates directly (already ranked by fusion score)
+                console.warn(`[QMD] Reranker failed/timeout, returning RRF-ordered results:`, err.message);
+                finalResults = candidates.slice(0, limit);
             }
         }
         else if (options?.rerank) {
@@ -907,8 +918,8 @@ export class QMDStore {
         console.log(`[QMD] Loading rerank model: ${modelPath}...`);
         try {
             if (!this.llamaInstance) {
-                const { getLlama } = await import('node-llama-cpp');
-                this.llamaInstance = await getLlama();
+                const { getLlama, LlamaLogLevel } = await import('node-llama-cpp');
+                this.llamaInstance = await getLlama({ logLevel: LlamaLogLevel.error });
             }
             this.rerankModelInstance = await this.llamaInstance.loadModel({
                 modelPath: modelPath,
@@ -993,8 +1004,8 @@ export class QMDStore {
         }
         console.log(`[QMD] Loading embedding model: ${modelPath}...`);
         try {
-            const { getLlama } = await import('node-llama-cpp');
-            this.llamaInstance = await getLlama();
+            const { getLlama, LlamaLogLevel } = await import('node-llama-cpp');
+            this.llamaInstance = await getLlama({ logLevel: LlamaLogLevel.error });
             console.log('[QMD] Llama instance ready');
             this.embeddingModelInstance = await this.llamaInstance.loadModel({
                 modelPath: modelPath,
