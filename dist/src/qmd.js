@@ -869,7 +869,7 @@ export class QMDStore {
         try {
             const { resolveModelFile } = await import('node-llama-cpp');
             // 默认 reranker 模型 - 使用 HuggingFace URI 格式
-            const defaultModel = this.rerankModel || 'hf:ggml-org/Qwen3-Reranker-0.6B-GGUF/qwen3-reranker-0.6b-q8_0.gguf';
+            const defaultModel = this.rerankModel || 'hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf';
             console.log(`[QMD] Resolving rerank model: ${defaultModel}...`);
             const modelPath = await resolveModelFile(defaultModel);
             console.log(`[QMD] Rerank model resolved to: ${modelPath}`);

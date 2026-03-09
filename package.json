@@ -28,7 +28,7 @@
     "test": "node test/index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0",
+    "better-sqlite3": "^12.6.2",
     "chokidar": "^5.0.0",
     "glob": "^11.0.0",
     "gray-matter": "^4.0.3",
